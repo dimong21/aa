@@ -12,11 +12,23 @@ import traceback
 import threading
 
 # ============================================================
-# КОНФИГУРАЦИЯ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ДЛЯ BOTHOST)
+# КОНФИГУРАЦИЯ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ)
 # ============================================================
 VK_TOKEN = os.environ.get('VK_TOKEN')
-GROUP_ID = int(os.environ.get('GROUP_ID', 0))
-OWNER_ID = int(os.environ.get('OWNER_ID', 0))
+GROUP_ID = os.environ.get('GROUP_ID')
+OWNER_ID = os.environ.get('OWNER_ID')
+
+if not VK_TOKEN:
+    raise Exception("❌ ОШИБКА: VK_TOKEN не задан!")
+if not GROUP_ID:
+    raise Exception("❌ ОШИБКА: GROUP_ID не задан!")
+if not OWNER_ID:
+    raise Exception("❌ ОШИБКА: OWNER_ID не задан!")
+
+GROUP_ID = int(GROUP_ID)
+OWNER_ID = int(OWNER_ID)
+
+print(f"✅ Конфигурация загружена: GROUP_ID={GROUP_ID}, OWNER_ID={OWNER_ID}")
 
 PREFIXES = ['/', '.', '!', '*']
 
@@ -56,9 +68,13 @@ vk = vk_session.get_api()
 longpoll = VkBotLongPoll(vk_session, GROUP_ID)
 
 # ============================================================
-# БАЗА ДАННЫХ SQLITE (ПОЛНОСТЬЮ ИСПРАВЛЕНА)
+# БАЗА ДАННЫХ SQLITE
 # ============================================================
-conn = sqlite3.connect('bot.db', check_same_thread=False)
+data_dir = os.environ.get('AMVERA_DATA', '.')
+db_path = os.path.join(data_dir, 'bot.db')
+print(f"📁 База данных: {db_path}")
+
+conn = sqlite3.connect(db_path, check_same_thread=False)
 cursor = conn.cursor()
 
 # Таблица пользователей
@@ -271,7 +287,7 @@ CREATE TABLE IF NOT EXISTS chat_roles (
 )
 ''')
 
-# ========== ВАЖНО: Таблица для ожидающих ответов ==========
+# Таблица для ожидающих ответов
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS pending_answers (
     user_id INTEGER,
@@ -281,10 +297,10 @@ CREATE TABLE IF NOT EXISTS pending_answers (
     date TEXT
 )
 ''')
-# ==========================================================
 
 conn.commit()
-print("✅ База данных инициализирована, все таблицы созданы")
+print("✅ База данных инициализирована")
+
 # ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
@@ -463,6 +479,18 @@ def format_user_link(user_id):
     name = user_data[1] or get_user_link(user_id)
     return f"[id{user_id}|{name}]"
 
+def check_sysban_on_join(user_id, peer_id):
+    """Проверка при добавлении в беседу - если пользователь в ЧС, кикаем"""
+    user_data = get_user_data(user_id)
+    if user_data[17] == 1:  # sysban_level 1
+        try:
+            vk.messages.removeChatUser(chat_id=peer_id - 2000000000, user_id=user_id)
+            send_message(peer_id, f"🚫 {format_user_link(user_id)} находится в ЧЁРНОМ СПИСКЕ бота! Осторожнее с данным человеком.")
+        except:
+            pass
+        return True
+    return False
+
 # ============================================================
 # КЛАВИАТУРЫ
 # ============================================================
@@ -547,13 +575,22 @@ def get_rating_keyboard(report_id, agent_number):
 
 def get_agent_access_keyboard(user_id, current_access):
     keyboard = VkKeyboard(inline=True)
-    secret_commands = ["sysban", "sysinfo", "logs", "givevip", "givemoney", "giveactive", "sysrestart", "getbotstats"]
-    for cmd in secret_commands:
+    secret_commands = ["sysban", "sysinfo", "logs", "givevip", "givemoney", "giveactive", "sysrestart", "getbotstats", "bhelp"]
+    
+    # Разбиваем команды на строки по 4 кнопки
+    row = []
+    for i, cmd in enumerate(secret_commands):
         status = "✅" if current_access.get(cmd, False) else "❌"
-        keyboard.add_callback_button(f"{status} /{cmd}", 
-                                    VkKeyboardColor.PRIMARY if current_access.get(cmd) else VkKeyboardColor.SECONDARY,
-                                    payload={"action": "toggle_access", "target_id": user_id, "command": cmd})
-    keyboard.add_line()
+        row.append((f"{status} /{cmd}", cmd))
+        
+        if len(row) == 4 or i == len(secret_commands) - 1:
+            for label, cmd_name in row:
+                keyboard.add_callback_button(label, 
+                                            VkKeyboardColor.PRIMARY if current_access.get(cmd_name) else VkKeyboardColor.SECONDARY,
+                                            payload={"action": "toggle_access", "target_id": user_id, "command": cmd_name})
+            keyboard.add_line()
+            row = []
+    
     keyboard.add_callback_button("🔒 Закрыть", VkKeyboardColor.NEGATIVE, payload={"action": "close"})
     return keyboard
 
@@ -566,6 +603,7 @@ def get_ping_keyboard():
     keyboard = VkKeyboard(inline=True)
     keyboard.add_callback_button("🔄 Обновить", VkKeyboardColor.PRIMARY, payload={"action": "ping_refresh"})
     return keyboard
+
 # ============================================================
 # ОСНОВНЫЕ КОМАНДЫ
 # ============================================================
@@ -727,9 +765,11 @@ def handle_stats(peer_id, user_id, args, reply_to_user_id=None):
     
     chat_role = get_user_role_in_chat(peer_id, target_id)
     
+    # Безопасное форматирование для агента
     agent_text = ""
-    if user_data[15]:
-        agent_text = f"\n🕵️ Агент поддержки №{user_data[15]}\n⭐ Рейтинг: {user_data[16]:.1f}"
+    if user_data[15] is not None and user_data[15] > 0:
+        rating = user_data[16] if user_data[16] is not None else 0
+        agent_text = f"\n🕵️ Агент поддержки №{user_data[15]}\n⭐ Рейтинг: {rating:.1f}"
     
     sysban_text = ""
     if user_data[17] == 1:
@@ -1225,6 +1265,63 @@ def handle_start(peer_id, user_id):
 📝 /report [текст] - сообщить о проблеме
 
 Приятного общения!""")
+
+# ============================================================
+# СПРАВКА /help И /bhelp
+# ============================================================
+
+def handle_help(peer_id, user_id):
+    send_message(peer_id, "📚 *СПРАВКА ПО КОМАНДАМ*\n━━━━━━━━━━━━━━━━━━━━\n\n📖 Полный список команд: https://vk.com/@your_community_commands")
+
+def handle_bhelp(peer_id, user_id):
+    if not has_agent_access(user_id, "bhelp") and user_id != OWNER_ID:
+        send_message(peer_id, "❌ У вас нет доступа к этой команде!")
+        return
+    
+    available_commands = []
+    secret_commands = ["sysban", "sysinfo", "logs", "givevip", "givemoney", "giveactive", "sysrestart", "getbotstats"]
+    
+    for cmd in secret_commands:
+        if has_agent_access(user_id, cmd):
+            available_commands.append(cmd)
+    
+    if not available_commands:
+        send_message(peer_id, "❌ У вас нет доступа ни к одной секретной команде!")
+        return
+    
+    agent_num = get_agent_number(user_id)
+    
+    text = f"""🕵️ *СЕКРЕТНЫЕ КОМАНДЫ*
+━━━━━━━━━━━━━━━━━━━━
+👤 Агент №{agent_num if agent_num else '?'}
+
+━━━━━━━━━━━━━━━━━━━━
+📋 *Доступные команды:*
+━━━━━━━━━━━━━━━━━━━━
+"""
+    if "sysban" in available_commands:
+        text += "🚫 /sysban [@user] [1-4] [причина] - системный бан\n"
+    if "sysinfo" in available_commands:
+        text += "ℹ️ /sysinfo [@user] - полная информация о пользователе\n"
+    if "logs" in available_commands:
+        text += "📋 /logs [@user] - логи пользователя\n"
+    if "givevip" in available_commands:
+        text += "💎 /givevip [@user] [1-3] [дней] - выдать VIP\n"
+    if "givemoney" in available_commands:
+        text += "💰 /givemoney [@user] [валюта] [сумма] - выдать деньги\n"
+    if "giveactive" in available_commands:
+        text += "⭐ /giveactive [@user] [опыт] - выдать опыт активности\n"
+    if "sysrestart" in available_commands:
+        text += "🔄 /sysrestart - перезагрузка бота\n"
+    if "getbotstats" in available_commands:
+        text += "📊 /getbotstats - статистика бота\n"
+    
+    text += """
+━━━━━━━━━━━━━━━━━━━━
+💡 *Доступы выдаёт владелец бота через /agent access*"""
+    
+    send_message(peer_id, text)
+
 # ============================================================
 # СИСТЕМА АГЕНТОВ И СЕКРЕТНЫЕ КОМАНДЫ
 # ============================================================
@@ -1293,13 +1390,14 @@ def handle_agent(peer_id, user_id, args):
             send_message(peer_id, "❌ Пользователь не является агентом!")
             return
         
+        rating = get_user_data(target_id)[16] if get_user_data(target_id)[16] is not None else 0
         text = f"""🕵️ *ИНФОРМАЦИЯ ОБ АГЕНТЕ*
 ━━━━━━━━━━━━━━━━━━━━
 
 🔢 Номер: #{agent[1]}
 📅 Добавлен: {agent[3]}
 📊 Закрыто тикетов: {agent[5]}
-⭐ Рейтинг: {get_user_data(target_id)[16]:.1f}"""
+⭐ Рейтинг: {rating:.1f}"""
         send_message(peer_id, text)
         
     elif subcmd == "access":
@@ -1357,6 +1455,7 @@ def handle_sysban(peer_id, user_id, args):
     issuer = f"Агент №{agent_num}" if agent_num else "Система"
     
     if level == 1:
+        # Кик из всех чатов + обнуление баланса
         cursor.execute("SELECT peer_id FROM chats WHERE active = 1")
         for chat in cursor.fetchall():
             try:
@@ -1364,26 +1463,32 @@ def handle_sysban(peer_id, user_id, args):
             except:
                 pass
         cursor.execute("UPDATE users SET balance_euro = 0, balance_dollar = 0, balance_ruble = 0, balance_btc = 0 WHERE user_id = ?", (target_id,))
+        send_message(peer_id, f"🚫 {issuer} выдал системный бан (Полный ЧС) {format_user_link(target_id)}\n📝 Причина: {reason}\n\n⚠️ Пользователь находится в чёрном списке бота! Осторожнее с данным человеком.")
         
     elif level == 2:
+        # Только кик из чатов
         cursor.execute("SELECT peer_id FROM chats WHERE active = 1")
         for chat in cursor.fetchall():
             try:
                 vk.messages.removeChatUser(chat_id=chat[0] - 2000000000, user_id=target_id)
             except:
                 pass
+        send_message(peer_id, f"🚫 {issuer} выдал системный бан (Кик из чатов) {format_user_link(target_id)}\n📝 Причина: {reason}\n\n⚠️ Пользователь находится в чёрном списке бота! Осторожнее с данным человеком.")
                 
     elif level == 3:
+        # Только обнуление баланса
         cursor.execute("UPDATE users SET balance_euro = 0, balance_dollar = 0, balance_ruble = 0, balance_btc = 0 WHERE user_id = ?", (target_id,))
+        send_message(peer_id, f"🚫 {issuer} выдал системный бан (Обнуление баланса) {format_user_link(target_id)}\n📝 Причина: {reason}")
         
     elif level == 4:
+        # Полный снос
         cursor.execute("DELETE FROM users WHERE user_id = ?", (target_id,))
         cursor.execute("DELETE FROM slaves WHERE slave_id = ? OR owner_id = ?", (target_id, target_id))
         cursor.execute("DELETE FROM marriages WHERE user1_id = ? OR user2_id = ?", (target_id, target_id))
         cursor.execute("DELETE FROM agents WHERE user_id = ?", (target_id,))
         cursor.execute("DELETE FROM union_roles WHERE user_id = ?", (target_id,))
         cursor.execute("DELETE FROM inventory WHERE user_id = ?", (target_id,))
-        send_message(peer_id, f"💀 Пользователь полностью удалён из БД бота!")
+        send_message(peer_id, f"💀 {issuer} полностью удалил {format_user_link(target_id)} из БД бота!\n📝 Причина: {reason}")
         conn.commit()
         return
     
@@ -1391,8 +1496,6 @@ def handle_sysban(peer_id, user_id, args):
                   (level, reason, user_id, target_id))
     conn.commit()
     
-    level_names = {1: "Полный ЧС", 2: "Кик из чатов", 3: "Обнуление баланса", 4: "Полный снос"}
-    send_message(peer_id, f"🚫 {issuer} выдал системный бан ({level_names[level]}) пользователю\n📝 Причина: {reason}")
     add_suspicious_log(target_id, "sysban", f"Системный бан уровня {level} от {user_id}: {reason}")
 
 def handle_unsysban(peer_id, user_id, args):
@@ -1414,7 +1517,7 @@ def handle_unsysban(peer_id, user_id, args):
     cursor.execute("UPDATE users SET sysban_level = 0, sysban_reason = NULL, sysban_by = NULL WHERE user_id = ?", (target_id,))
     conn.commit()
     
-    send_message(peer_id, f"✅ Снят системный бан с пользователя\n📝 Причина: {reason}")
+    send_message(peer_id, f"✅ Снят системный бан с {format_user_link(target_id)}\n📝 Причина: {reason}")
 
 def handle_sysinfo(peer_id, user_id, args):
     if not has_agent_access(user_id, "sysinfo") and user_id != OWNER_ID:
@@ -1433,6 +1536,7 @@ def handle_sysinfo(peer_id, user_id, args):
     user_data = get_user_data(target_id)
     
     level_names = {0: "❌ Нет", 1: "⚠️ Полный ЧС", 2: "⚠️ Кикнут", 3: "💰 Обнулён", 4: "💀 Удалён"}
+    rating = user_data[16] if user_data[16] is not None else 0
     
     text = f"""🔍 *СИСТЕМНАЯ ИНФОРМАЦИЯ*
 ━━━━━━━━━━━━━━━━━━━━
@@ -1483,7 +1587,8 @@ def handle_botadmins(peer_id, user_id):
     text = "🕵️ *СПИСОК АГЕНТОВ ПОДДЕРЖКИ*\n━━━━━━━━━━━━━━━━━━━━\n\n"
     for agent_id, agent_num, tickets in agents:
         user_data = get_user_data(agent_id)
-        text += f"#{agent_num}\n📊 Тикетов: {tickets} | ⭐ Рейтинг: {user_data[16]:.1f}\n━━━━━━━━━━━━━━━━━━━━\n"
+        rating = user_data[16] if user_data[16] is not None else 0
+        text += f"#{agent_num}\n📊 Тикетов: {tickets} | ⭐ Рейтинг: {rating:.1f}\n━━━━━━━━━━━━━━━━━━━━\n"
     
     send_message(peer_id, text)
 
@@ -1516,7 +1621,7 @@ def handle_givevip(peer_id, user_id, args):
     cursor.execute("UPDATE users SET vip_level = ?, vip_until = ? WHERE user_id = ?", (level, vip_until, target_id))
     conn.commit()
     
-    send_message(peer_id, f"✅ Пользователь получил VIP {level} уровень на {days} дней!")
+    send_message(peer_id, f"✅ {format_user_link(target_id)} получил VIP {level} уровень на {days} дней!")
 
 def handle_givemoney(peer_id, user_id, args):
     if not has_agent_access(user_id, "givemoney") and user_id != OWNER_ID:
@@ -1544,7 +1649,7 @@ def handle_givemoney(peer_id, user_id, args):
         return
     
     update_balance(target_id, currency, amount)
-    send_message(peer_id, f"✅ Пользователь получил {amount:.2f} {currency}!")
+    send_message(peer_id, f"✅ {format_user_link(target_id)} получил {amount:.2f} {currency}!")
 
 def handle_giveactive(peer_id, user_id, args):
     if not has_agent_access(user_id, "giveactive") and user_id != OWNER_ID:
@@ -1567,7 +1672,7 @@ def handle_giveactive(peer_id, user_id, args):
         return
     
     add_activity_exp(target_id, exp)
-    send_message(peer_id, f"✅ Пользователь получил {exp} опыта активности!")
+    send_message(peer_id, f"✅ {format_user_link(target_id)} получил {exp} опыта активности!")
 
 def handle_logs(peer_id, user_id, args):
     if not has_agent_access(user_id, "logs") and user_id != OWNER_ID:
@@ -2002,7 +2107,7 @@ def handle_grole(peer_id, user_id, args):
         return
     cursor.execute("INSERT OR REPLACE INTO union_roles (union_id, user_id, role_name) VALUES (?, ?, ?)", (union_id, target_id, role))
     conn.commit()
-    send_message(peer_id, f"✅ Пользователь получил роль «{role}» в объединении!")
+    send_message(peer_id, f"✅ {format_user_link(target_id)} получил роль «{role}» в объединении!")
 
 def handle_gban(peer_id, user_id, args):
     if len(args) < 1:
@@ -2029,7 +2134,7 @@ def handle_gban(peer_id, user_id, args):
             vk.messages.removeChatUser(chat_id=chat[0] - 2000000000, user_id=target_id)
         except:
             pass
-    send_message(peer_id, f"🔨 Пользователь забанен во всех беседах объединения!")
+    send_message(peer_id, f"🔨 {format_user_link(target_id)} забанен во всех беседах объединения!")
 
 def handle_gkick(peer_id, user_id, args):
     if len(args) < 1:
@@ -2052,7 +2157,7 @@ def handle_gkick(peer_id, user_id, args):
         return
     try:
         vk.messages.removeChatUser(chat_id=peer_id - 2000000000, user_id=target_id)
-        send_message(peer_id, f"👢 Пользователь кикнут из беседы!")
+        send_message(peer_id, f"👢 {format_user_link(target_id)} кикнут из беседы!")
     except:
         send_message(peer_id, "❌ Ошибка при кике!")
 
@@ -2079,7 +2184,7 @@ def handle_gmute(peer_id, user_id, args):
         cursor.execute("INSERT OR REPLACE INTO temp_mutes (user_id, peer_id, until, reason) VALUES (?, ?, ?, ?)",
                       (target_id, chat[0], until, "Мут в объединении"))
     conn.commit()
-    send_message(peer_id, f"🔇 Пользователь замучен во всех беседах объединения на {time_str}!")
+    send_message(peer_id, f"🔇 {format_user_link(target_id)} замучен во всех беседах объединения на {time_str}!")
 
 def handle_gzov(peer_id, user_id, args):
     if len(args) < 1:
@@ -2529,7 +2634,7 @@ def handle_sysrole(peer_id, user_id, args):
         send_message(peer_id, "❌ Пользователь не найден!")
         return
     role = " ".join(args[1:])
-    send_message(peer_id, f"✅ Пользователь получил роль «{role}» от системного администратора!")
+    send_message(peer_id, f"✅ {format_user_link(target_id)} получил роль «{role}» от системного администратора!")
 
 def handle_gsysrole(peer_id, user_id, args):
     if user_id != OWNER_ID:
@@ -2550,7 +2655,7 @@ def handle_gsysrole(peer_id, user_id, args):
     role = " ".join(args[2:])
     cursor.execute("INSERT OR REPLACE INTO union_roles (union_id, user_id, role_name) VALUES (?, ?, ?)", (union_id, target_id, role))
     conn.commit()
-    send_message(peer_id, f"✅ Пользователь получил роль «{role}» в объединении {union_id}!")
+    send_message(peer_id, f"✅ {format_user_link(target_id)} получил роль «{role}» в объединении {union_id}!")
 
 # ============================================================
 # ОБРАБОТЧИКИ CALLBACK
@@ -2689,10 +2794,11 @@ def handle_callback(event):
                 conn.commit()
                 
                 user_data = get_user_data(agent_id)
-                if user_data[16] == 0:
+                old_rating = user_data[16] if user_data[16] is not None else 0
+                if old_rating == 0:
                     new_rating = rating
                 else:
-                    new_rating = (user_data[16] + rating) / 2
+                    new_rating = (old_rating + rating) / 2
                 cursor.execute("UPDATE users SET agent_rating = ? WHERE user_id = ?", (new_rating, agent_id))
                 conn.commit()
                 
@@ -2957,7 +3063,9 @@ def main():
                         elif cmd in ['staff', 'админы']:
                             handle_staff(peer_id)
                         elif cmd in ['help', 'помощь']:
-                            send_message(peer_id, "📚 *СПРАВКА ПО КОМАНДАМ*\n━━━━━━━━━━━━━━━━━━━━\n\n📖 Полный список команд: https://vk.com/@your_community_commands\n\n📌 Основные команды:\n/stats - статистика\n/balance - баланс\n/work - работа\n/рулетка - казино\n/report - жалоба\n/рабы - система рабов\n/брак - система браков\n/vip - VIP магазин\n/shop - магазин\n/top - топы\n/staff - админы\n/activity - уровень активности")
+                            handle_help(peer_id, user_id)
+                        elif cmd in ['bhelp']:
+                            handle_bhelp(peer_id, user_id)
                         else:
                             similar_cmds = ['ban', 'kick', 'mute', 'warn', 'stats', 'vip', 'balance', 'work', 'bonus', 'shop', 'report']
                             for sc in similar_cmds:
@@ -2972,6 +3080,10 @@ def main():
             elif event.type == VkBotEventType.GROUP_JOIN:
                 peer_id = event.obj.peer_id
                 user_id = event.obj.user_id
+                
+                # Проверка на системный бан при добавлении
+                if check_sysban_on_join(user_id, peer_id):
+                    continue
                 
                 cursor.execute("SELECT welcome_message FROM chats WHERE peer_id = ?", (peer_id,))
                 result = cursor.fetchone()
@@ -2998,4 +3110,4 @@ def main():
             traceback.print_exc()
 
 if __name__ == "__main__":
-    main()
+    main()  
