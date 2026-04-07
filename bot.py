@@ -1351,9 +1351,6 @@ def handle_agent(peer_id, user_id, args):
         if is_agent(target_id):
             send_message(peer_id, "❌ Пользователь уже является агентом!")
             return
-        if target_id == OWNER_ID:
-            send_message(peer_id, "❌ Нельзя добавить владельца в агенты!")
-            return
         
         agent_num = get_next_agent_number()
         cursor.execute("INSERT INTO agents (user_id, agent_number, added_by, added_date, commands_access, tickets_closed) VALUES (?, ?, ?, ?, ?, 0)",
